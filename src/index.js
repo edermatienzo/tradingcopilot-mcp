@@ -4,7 +4,7 @@ import express from "express";
 import axios from "axios";
 import jwt from "jsonwebtoken";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -52,11 +52,12 @@ async function callApi(path, params = {}) {
   }
 }
 
-// ── MCP server ────────────────────────────────────────────────────────────────
-const server = new McpServer({
-  name: "massive-trading-copilot",
-  version: "1.0.0",
-});
+// ── MCP server factory (one instance per client session) ─────────────────────
+function createMcpServer() {
+  const server = new McpServer({
+    name: "massive-trading-copilot",
+    version: "1.0.0",
+  });
 
 // ── Tool: get_ticker_info ─────────────────────────────────────────────────────
 server.tool(
@@ -407,7 +408,10 @@ server.tool(
   }
 );
 
-// ── Express / SSE transport ───────────────────────────────────────────────────
+  return server;
+}
+
+// ── Express / StreamableHTTP transport ───────────────────────────────────────
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
@@ -550,30 +554,53 @@ function requireOAuth(req, res, next) {
   }
 }
 
-/** Map of sessionId → SSEServerTransport (one per connected client) */
+// ── StreamableHTTP sessions: sessionId → transport ───────────────────────────
 const transports = new Map();
 
-app.get("/sse", requireOAuth, async (_req, res) => {
-  const transport = new SSEServerTransport("/messages", res);
-  transports.set(transport.sessionId, transport);
+// POST /  — new session (no mcp-session-id) or message on existing session
+app.post("/", requireOAuth, async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"];
 
-  res.on("close", () => {
-    transports.delete(transport.sessionId);
-  });
-
-  await server.connect(transport);
-});
-
-app.post("/messages", requireOAuth, async (req, res) => {
-  const sessionId = req.query.sessionId;
-  const transport = transports.get(sessionId);
+  let transport = sessionId ? transports.get(sessionId) : null;
 
   if (!transport) {
-    res.status(400).json({ error: `No active SSE session for id: ${sessionId}` });
+    transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => crypto.randomUUID(),
+      onsessioninitialized: (sid) => transports.set(sid, transport),
+    });
+    transport.onclose = () => {
+      if (transport.sessionId) transports.delete(transport.sessionId);
+    };
+    await createMcpServer().connect(transport);
+  }
+
+  await transport.handleRequest(req, res, req.body);
+});
+
+// GET /  — open SSE stream for server→client notifications
+app.get("/", requireOAuth, async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"];
+  const transport = sessionId ? transports.get(sessionId) : null;
+
+  if (!transport) {
+    res.status(400).json({ error: "Invalid or missing mcp-session-id header." });
     return;
   }
 
-  await transport.handlePostMessage(req, res);
+  await transport.handleRequest(req, res);
+});
+
+// DELETE /  — close session
+app.delete("/", requireOAuth, async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"];
+  const transport = sessionId ? transports.get(sessionId) : null;
+
+  if (transport) {
+    await transport.close();
+    transports.delete(sessionId);
+  }
+
+  res.status(200).end();
 });
 
 // ── Health check (public) ─────────────────────────────────────────────────────
@@ -583,8 +610,7 @@ app.get("/health", (_req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Massive Trading Copilot MCP server running on port ${PORT}`);
-  console.log(`  Public URL    : ${PUBLIC_URL}`);
-  console.log(`  SSE endpoint  : ${PUBLIC_URL}/sse`);
+  console.log(`  MCP endpoint  : ${PUBLIC_URL}/`);
   console.log(`  Authorize     : ${PUBLIC_URL}/authorize`);
   console.log(`  Token         : ${PUBLIC_URL}/token`);
   console.log(`  OAuth metadata: ${PUBLIC_URL}/.well-known/oauth-authorization-server`);
