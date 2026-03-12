@@ -1,18 +1,37 @@
 import "dotenv/config";
+import crypto from "crypto";
 import express from "express";
 import axios from "axios";
+import jwt from "jsonwebtoken";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const API_KEY = process.env.MASSIVE_API_KEY;
-const PORT = parseInt(process.env.PORT ?? "3000", 10);
-const BASE_URL = "https://api.massive.com";
+const API_KEY         = process.env.MASSIVE_API_KEY;
+const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID;
+const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET;
+const JWT_SECRET      = process.env.JWT_SECRET;
+const TOKEN_TTL       = parseInt(process.env.TOKEN_TTL_SECONDS ?? "3600", 10); // 1 h default
+const PORT            = parseInt(process.env.PORT ?? "3000", 10);
+// PUBLIC_URL: explicit env var → Railway auto-domain → localhost fallback
+const PUBLIC_URL = (
+  process.env.PUBLIC_URL ??
+  (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : null) ??
+  `http://localhost:${PORT}`
+).replace(/\/$/, "");
+const BASE_URL        = "https://api.massive.com";
 
-if (!API_KEY) {
-  console.error("ERROR: MASSIVE_API_KEY is not set in environment variables.");
-  process.exit(1);
+for (const [name, val] of [
+  ["MASSIVE_API_KEY",    API_KEY],
+  ["OAUTH_CLIENT_ID",    OAUTH_CLIENT_ID],
+  ["OAUTH_CLIENT_SECRET",OAUTH_CLIENT_SECRET],
+  ["JWT_SECRET",         JWT_SECRET],
+]) {
+  if (!val) {
+    console.error(`ERROR: ${name} is not set in environment variables.`);
+    process.exit(1);
+  }
 }
 
 // ── Axios client ──────────────────────────────────────────────────────────────
@@ -391,11 +410,150 @@ server.tool(
 // ── Express / SSE transport ───────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
+
+// ── In-memory auth code store { code → { client_id, redirect_uri, challenge, expires_at } }
+const authCodes = new Map();
+
+// ── OAuth 2.0 – Server metadata (RFC 8414) ────────────────────────────────────
+// Claude.ai fetches this endpoint to discover authorization_endpoint and token_endpoint.
+app.get("/.well-known/oauth-authorization-server", (_req, res) => {
+  const base = PUBLIC_URL;
+  res.json({
+    issuer: base,
+    authorization_endpoint: `${base}/authorize`,
+    token_endpoint: `${base}/token`,
+    grant_types_supported: ["authorization_code", "client_credentials"],
+    response_types_supported: ["code"],
+    code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["client_secret_post"],
+  });
+});
+
+// ── OAuth 2.0 – Authorization endpoint (RFC 6749 §4.1 + PKCE RFC 7636) ───────
+// Claude.ai redirects the user here with client_id, redirect_uri, code_challenge.
+app.get("/authorize", (req, res) => {
+  const { client_id, redirect_uri, response_type, state, code_challenge, code_challenge_method } = req.query;
+
+  if (response_type !== "code") {
+    res.status(400).json({ error: "unsupported_response_type" });
+    return;
+  }
+
+  if (client_id !== OAUTH_CLIENT_ID) {
+    res.status(401).json({ error: "invalid_client" });
+    return;
+  }
+
+  if (!redirect_uri) {
+    res.status(400).json({ error: "invalid_request", error_description: "redirect_uri is required." });
+    return;
+  }
+
+  // Generate a one-time authorization code (5-minute TTL)
+  const code = crypto.randomBytes(32).toString("hex");
+  authCodes.set(code, {
+    client_id,
+    redirect_uri,
+    challenge: code_challenge ?? null,
+    challenge_method: code_challenge_method ?? null,
+    expires_at: Date.now() + 5 * 60 * 1000,
+  });
+
+  // Auto-approve and redirect back to Claude.ai with the code.
+  const target = new URL(redirect_uri);
+  target.searchParams.set("code", code);
+  if (state) target.searchParams.set("state", state);
+  res.redirect(target.toString());
+});
+
+// ── OAuth 2.0 – Token endpoint (authorization_code + client_credentials) ──────
+app.post("/token", (req, res) => {
+  const { grant_type, client_id, client_secret, code, redirect_uri, code_verifier } = req.body;
+
+  // ── Client Credentials (machine-to-machine) ──────────────────────────────
+  if (grant_type === "client_credentials") {
+    if (client_id !== OAUTH_CLIENT_ID || client_secret !== OAUTH_CLIENT_SECRET) {
+      res.status(401).set("WWW-Authenticate", 'Bearer error="invalid_client"').json({ error: "invalid_client" });
+      return;
+    }
+    const token = jwt.sign({ sub: client_id }, JWT_SECRET, { expiresIn: TOKEN_TTL });
+    res.json({ access_token: token, token_type: "Bearer", expires_in: TOKEN_TTL });
+    return;
+  }
+
+  // ── Authorization Code (Claude.ai flow) ──────────────────────────────────
+  if (grant_type === "authorization_code") {
+    if (client_id !== OAUTH_CLIENT_ID || client_secret !== OAUTH_CLIENT_SECRET) {
+      res.status(401).set("WWW-Authenticate", 'Bearer error="invalid_client"').json({ error: "invalid_client" });
+      return;
+    }
+
+    const stored = authCodes.get(code);
+    if (
+      !stored ||
+      stored.client_id !== client_id ||
+      stored.expires_at < Date.now() ||
+      (stored.redirect_uri && stored.redirect_uri !== redirect_uri)
+    ) {
+      authCodes.delete(code);
+      res.status(400).json({ error: "invalid_grant" });
+      return;
+    }
+
+    // Verify PKCE code_verifier when a challenge was provided
+    if (stored.challenge) {
+      if (!code_verifier) {
+        res.status(400).json({ error: "invalid_grant", error_description: "code_verifier is required." });
+        return;
+      }
+      const digest = crypto.createHash("sha256").update(code_verifier).digest("base64url");
+      if (digest !== stored.challenge) {
+        res.status(400).json({ error: "invalid_grant", error_description: "code_verifier mismatch." });
+        return;
+      }
+    }
+
+    authCodes.delete(code); // single-use
+    const token = jwt.sign({ sub: client_id }, JWT_SECRET, { expiresIn: TOKEN_TTL });
+    res.json({ access_token: token, token_type: "Bearer", expires_in: TOKEN_TTL });
+    return;
+  }
+
+  res.status(400).json({ error: "unsupported_grant_type" });
+});
+
+// ── OAuth middleware – validates Bearer JWT on protected routes ───────────────
+function requireOAuth(req, res, next) {
+  const bearer = req.headers["authorization"]?.replace(/^Bearer\s+/i, "");
+
+  if (!bearer) {
+    // Return the metadata URL so Claude.ai can discover the OAuth server.
+    res
+      .status(401)
+      .set(
+        "WWW-Authenticate",
+        `Bearer realm="mcp", resource_metadata="${PUBLIC_URL}/.well-known/oauth-authorization-server"`
+      )
+      .json({ error: "unauthorized", error_description: "Missing Authorization: Bearer <token> header." });
+    return;
+  }
+
+  try {
+    jwt.verify(bearer, JWT_SECRET);
+    next();
+  } catch {
+    res
+      .status(401)
+      .set("WWW-Authenticate", 'Bearer realm="mcp", error="invalid_token"')
+      .json({ error: "invalid_token", error_description: "Access token is invalid or expired." });
+  }
+}
 
 /** Map of sessionId → SSEServerTransport (one per connected client) */
 const transports = new Map();
 
-app.get("/sse", async (req, res) => {
+app.get("/sse", requireOAuth, async (_req, res) => {
   const transport = new SSEServerTransport("/messages", res);
   transports.set(transport.sessionId, transport);
 
@@ -406,7 +564,7 @@ app.get("/sse", async (req, res) => {
   await server.connect(transport);
 });
 
-app.post("/messages", async (req, res) => {
+app.post("/messages", requireOAuth, async (req, res) => {
   const sessionId = req.query.sessionId;
   const transport = transports.get(sessionId);
 
@@ -418,14 +576,17 @@ app.post("/messages", async (req, res) => {
   await transport.handlePostMessage(req, res);
 });
 
-// ── Health check ──────────────────────────────────────────────────────────────
+// ── Health check (public) ─────────────────────────────────────────────────────
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", sessions: transports.size });
 });
 
 app.listen(PORT, () => {
   console.log(`Massive Trading Copilot MCP server running on port ${PORT}`);
-  console.log(`  SSE endpoint : http://localhost:${PORT}/sse`);
-  console.log(`  Messages     : http://localhost:${PORT}/messages`);
-  console.log(`  Health       : http://localhost:${PORT}/health`);
+  console.log(`  Public URL    : ${PUBLIC_URL}`);
+  console.log(`  SSE endpoint  : ${PUBLIC_URL}/sse`);
+  console.log(`  Authorize     : ${PUBLIC_URL}/authorize`);
+  console.log(`  Token         : ${PUBLIC_URL}/token`);
+  console.log(`  OAuth metadata: ${PUBLIC_URL}/.well-known/oauth-authorization-server`);
+  console.log(`  Health        : ${PUBLIC_URL}/health`);
 });
