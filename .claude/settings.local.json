@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:massive.com)",
+      "Bash(npm install:*)"
+    ]
+  }
+}
