@@ -13,6 +13,8 @@ const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID;
 const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET;
 const JWT_SECRET      = process.env.JWT_SECRET;
 const TOKEN_TTL       = parseInt(process.env.TOKEN_TTL_SECONDS ?? "3600", 10); // 1 h default
+// DEBUG_LEVEL: "silent" | "info" (default) | "verbose"
+const DEBUG_LEVEL     = process.env.DEBUG_LEVEL ?? "info";
 const PORT            = parseInt(process.env.PORT ?? "3000", 10);
 // PUBLIC_URL: explicit env var → Railway auto-domain → localhost fallback
 const PUBLIC_URL = (
@@ -415,6 +417,33 @@ server.tool(
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
+
+// ── Request logger middleware ─────────────────────────────────────────────────
+app.use((req, res, next) => {
+  if (DEBUG_LEVEL === "silent") return next();
+
+  const start = Date.now();
+  const ts = new Date().toISOString();
+
+  if (DEBUG_LEVEL === "verbose") {
+    const headers = { ...req.headers };
+    if (headers.authorization) headers.authorization = "Bearer [REDACTED]";
+    console.log(`[${ts}] --> ${req.method} ${req.originalUrl}`);
+    console.log(`         headers: ${JSON.stringify(headers)}`);
+    if (req.body && Object.keys(req.body).length > 0) {
+      const body = { ...req.body };
+      if (body.client_secret) body.client_secret = "[REDACTED]";
+      console.log(`         body:    ${JSON.stringify(body)}`);
+    }
+  }
+
+  res.on("finish", () => {
+    const ms = Date.now() - start;
+    console.log(`[${ts}] ${req.method} ${req.originalUrl} → ${res.statusCode} (${ms}ms)`);
+  });
+
+  next();
+});
 
 // ── In-memory auth code store { code → { client_id, redirect_uri, challenge, expires_at } }
 const authCodes = new Map();
